@@ -1,8 +1,17 @@
-from fastapi import FastAPI, HTTPException
-from app.schemas import PostCreate, DeletePost, PostResponse
-from app.db import Post, create_db_and_tables, get_async_session
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Depends
+from app.schemas import PostCreate, DeletePost, PostResponse, UserRead, UserCreate, UseUpdate
+from app.db import Post, create_db_and_tables, get_async_session, User
 from sqlalchemy.ext.asyncio import AsyncSession
 from contextlib import asynccontextmanager
+from sqlalchemy import select
+from app.images import imageKit
+from imagekitio.models.UploadFileRequestOptions import UploadFileRequestOptions
+import shutil
+import os
+import uuid
+import tempfile
+from app.users import auth_backend, current_active_user, fastapi_users
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -13,42 +22,104 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-text_posts = {
-    1: {"title": "New post", "content": "Cool test post about FastAPI."},
-    2: {"title": "Learning Python", "content": "Today I learned about dictionaries and functions."},
-    3: {"title": "FastAPI Tips", "content": "FastAPI makes building APIs super fast and clean!"},
-    4: {"title": "My First API", "content": "Just deployed my first API using Uvicorn and FastAPI."},
-    5: {"title": "Async in Python", "content": "Understanding async/await can really improve performance."},
-    6: {"title": "SQLAlchemy Intro", "content": "ORMs make database interactions much easier."},
-    7: {"title": "Docker for Devs", "content": "Containerizing apps simplifies deployment."},
-    8: {"title": "Frontend vs Backend", "content": "Exploring how APIs power modern web apps."},
-    9: {"title": "APIs Everywhere", "content": "APIs connect services across the internet — they’re the glue of modern apps."},
-    10: {"title": "Deploying to Render", "content": "Quick guide: how to deploy a FastAPI app for free."}
-}
+app.include_router(fastapi_users.get_auth_router(auth_backend), prefix='/auth/jwt', tags=["auth"])
+app.include_router(fastapi_users.get_register_router(UserRead, UserCreate), prefix='/auth', tags=['auth'])
+app.include_router(fastapi_users.get_reset_password_router(), prefix="/auth", tags=["auth"])
+app.include_router(fastapi_users.get_verify_router(UserRead), prefix="/auth", tags=["auth"])
+app.include_router(fastapi_users.get_users_router(UserRead, UseUpdate), prefix="/users", tags=["Users"])
 
-@app.get("/posts")
-def get_all_posts(limit: int=None):
-    if limit:
-        return list(text_posts.values())[:limit]
-    return text_posts
+@app.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    caption: str = Form(""),
+    user: User = Depends(current_active_user),
+    session: AsyncSession = Depends(get_async_session)
+):
+    temp_file_path = None
 
-@app.get("/posts/{id}")
-def get_a_post(id:int) -> PostResponse:
-    if id not in text_posts:
-        raise HTTPException(status_code=404, detail="Post not found")
-    return text_posts.get(id)
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
+            temp_file_path = temp_file.name
+            shutil.copyfileobj(file.file, temp_file)
+        upload_result = imageKit.upload_file(
+            file=open(temp_file_path, "rb"),
+            file_name=file.filename,
+            options=UploadFileRequestOptions(
+                use_unique_file_name=True,
+                tags = ["backend-upload"]
+            )
+        )
 
+        if upload_result.response_metadata.http_status_code == 200:
+            post = Post(
+                user_id = User.id,
+                caption = caption,
+                url = upload_result.url,
+                file_type = "video" if file.content_type.startswith("video/") else "image",
+                file_name = upload_result.name
+            )
+            session.add(post)
+            await session.commit()
+            await session.refresh(post)
 
-@app.post("/posts") 
-def create_post(post: PostCreate) -> PostResponse:
-    new_post = {"title":post.title, "content": post.content}
-    text_posts[max(text_posts.keys(), default=0)+1] = new_post
-    return new_post
     
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.unlink(temp_file_path)
+        file.file.close()
 
-@app.delete("/posts")
-def delete_post(post: DeletePost):
-    if post.id not in text_posts:
-        raise HTTPException(status_code=404, detail="Post not available to delete")
-    deleted_post = text_posts.pop(post.id)
-    return {"message": f"Post with id {post.id} deleted successfully", "post": deleted_post}
+
+@app.get("/feed")
+async def get_feed(
+    session: AsyncSession = Depends(get_async_session),
+    user: User = Depends(current_active_user),
+):
+    result = await session.execute(select(Post).order_by(Post.created_at.desc()))
+    posts = [row[0] for row in result.all()]
+
+    result = await session.execute(select(User))
+    users = [row[0] for row in result.all()]
+    users_dict = {u.id: u.email for u in users}
+
+    posts_data = []
+    for post in posts:
+        posts_data.append(
+            {
+                "id": str(post.id),
+                "user_id": str(post.user_id),
+                "caption": post.caption,
+                "url": post.url,
+                "file_type": post.file_type,
+                "file_name": post.file_name,
+                "created_at": post.created_at.isoformat(),
+                "is_owner": post.user_id == user.id,
+                "email": users_dict.get(post.user_id, "Unknown")
+            }
+        )
+    
+    return {"posts": posts_data}
+
+
+@app.delete("/posts/{post_id}")
+async def delete_post(post_id: str, session: AsyncSession = Depends(get_async_session), user: User = Depends(current_active_user)):
+    try:
+        post_uuid = uuid.UUID(post_id)
+
+        result = await session.execute(select(Post).where(Post.id ==  post_uuid))
+        post = result.scalars().first()
+
+        if not post:
+            raise HTTPException(status_code=404, detail="Post not found")
+        
+        if post.user_id != user.id:
+            raise HTTPException(status_code=403, detail="you are not authorized to perform this action")
+
+        await session.delete(post)
+        await session.commit()
+
+        return {"success": True, "message": "Post deleted successfully"}
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
